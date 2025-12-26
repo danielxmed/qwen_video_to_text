@@ -1,0 +1,21 @@
+# Core ML dependencies
+torch>=2.1.0
+transformers>=4.45.0
+accelerate>=0.26.0
+
+# Flash Attention for faster inference
+flash-attn>=2.5.0
+
+# Video processing
+av>=12.0.0
+decord>=0.6.0
+
+# AWS S3
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Image processing (required by transformers)
+Pillow>=10.0.0
