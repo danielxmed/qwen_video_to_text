@@ -20,7 +20,7 @@ class VideoCaptioner:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        model_name: str = "huihui-ai/Qwen2.5-VL-7B-Instruct-abliterated",
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
