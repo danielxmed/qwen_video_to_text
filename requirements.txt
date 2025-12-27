@@ -3,9 +3,6 @@ torch>=2.1.0
 transformers>=4.45.0
 accelerate>=0.26.0
 
-# Flash Attention for faster inference
-flash-attn>=2.5.0
-
 # Video processing
 av>=12.0.0
 decord>=0.6.0

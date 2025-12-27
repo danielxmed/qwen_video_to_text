@@ -10,8 +10,9 @@ import argparse
 import logging
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import get_context
+import time
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Process, Queue, get_context
 from typing import List, Optional
 
 import torch
@@ -38,92 +39,233 @@ def get_available_gpus() -> List[int]:
     return list(range(torch.cuda.device_count()))
 
 
-def process_video_on_gpu(
-    video_info: dict,
+def gpu_worker(
     gpu_id: int,
-    prompt: Optional[str] = None,
-    fps: float = 1.0,
-    max_tokens: int = 512,
-    skip_existing: bool = True,
-) -> dict:
+    task_queue: Queue,
+    result_queue: Queue,
+    prompt: Optional[str],
+    fps: float,
+    max_tokens: int,
+    skip_existing: bool,
+    batch_size: int = 1,
+):
     """
-    Process a single video on a specific GPU.
+    Persistent GPU worker with prefetching for optimal GPU utilization.
 
-    This function is designed to run in a separate process.
-
-    Args:
-        video_info: Dict with video metadata (key, url, name, bucket)
-        gpu_id: GPU device index to use
-        prompt: Custom prompt for caption generation
-        fps: Frames per second to sample
-        max_tokens: Maximum tokens to generate
-        skip_existing: Skip if caption already exists
-
-    Returns:
-        Dict with processing result
+    Downloads next batch while current batch is being processed by GPU.
     """
-    # Load environment variables in subprocess
     load_dotenv()
 
     device = f"cuda:{gpu_id}"
-    video_key = video_info["key"]
-    video_name = video_info["name"]
+    s3_handler = S3Handler()
 
-    result = {
-        "video_key": video_key,
-        "video_name": video_name,
-        "success": False,
-        "caption_key": None,
-        "error": None,
-        "skipped": False,
-    }
-
+    # Load model ONCE for this GPU
+    logger.info(f"[GPU {gpu_id}] Loading model (batch_size={batch_size}, prefetch=ON)...")
     try:
-        # Check if caption already exists
-        if skip_existing:
-            s3_handler = S3Handler()
-            if s3_handler.check_caption_exists(video_info["bucket"], video_key):
-                logger.info(f"[GPU {gpu_id}] Skipping {video_name} - caption exists")
-                result["skipped"] = True
-                result["success"] = True
-                return result
-
-        logger.info(f"[GPU {gpu_id}] Processing: {video_name}")
-
-        # Initialize captioner for this GPU
         captioner = VideoCaptioner(device=device)
-
-        # Generate caption
-        caption = captioner.generate_caption(
-            video_url=video_info["url"],
-            prompt=prompt,
-            max_new_tokens=max_tokens,
-            fps=fps,
-        )
-
-        logger.info(f"[GPU {gpu_id}] Generated caption for {video_name} ({len(caption)} chars)")
-
-        # Upload caption to S3
-        s3_handler = S3Handler()
-        caption_key = s3_handler.upload_caption(
-            bucket=video_info["bucket"],
-            video_key=video_key,
-            caption=caption,
-        )
-
-        result["success"] = True
-        result["caption_key"] = caption_key
-        logger.info(f"[GPU {gpu_id}] Uploaded: {caption_key}")
-
-        # Cleanup
-        del captioner
-        torch.cuda.empty_cache()
-
+        logger.info(f"[GPU {gpu_id}] Model loaded successfully")
     except Exception as e:
-        logger.error(f"[GPU {gpu_id}] Error processing {video_name}: {e}")
-        result["error"] = str(e)
+        logger.error(f"[GPU {gpu_id}] Failed to load model: {e}")
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            result_queue.put({
+                "video_key": task["key"],
+                "video_name": task["name"],
+                "success": False,
+                "error": f"Model failed to load: {e}",
+            })
+        return
 
-    return result
+    def collect_batch():
+        """Collect a batch of tasks from queue, filtering skipped ones."""
+        batch_tasks = []
+        got_poison = False
+
+        for _ in range(batch_size):
+            task = task_queue.get()
+            if task is None:
+                got_poison = True
+                break
+            batch_tasks.append(task)
+
+        # Filter out already processed videos
+        tasks_to_process = []
+        for video_info in batch_tasks:
+            video_key = video_info["key"]
+            video_name = video_info["name"]
+
+            if skip_existing and s3_handler.check_caption_exists(video_info["bucket"], video_key):
+                logger.info(f"[GPU {gpu_id}] Skipping {video_name} - caption exists")
+                result_queue.put({
+                    "video_key": video_key,
+                    "video_name": video_name,
+                    "success": True,
+                    "caption_key": None,
+                    "error": None,
+                    "skipped": True,
+                })
+            else:
+                tasks_to_process.append(video_info)
+
+        return tasks_to_process, got_poison
+
+    def preprocess_task(tasks):
+        """Preprocess a batch (download videos, extract frames)."""
+        if not tasks:
+            return None, tasks
+        video_urls = [t["url"] for t in tasks]
+        preprocessed = captioner.preprocess_batch(video_urls, prompt, fps)
+        return preprocessed, tasks
+
+    def process_batch(preprocessed, tasks):
+        """Run inference and upload results."""
+        if not tasks or preprocessed is None:
+            return
+
+        video_names = [t["name"] for t in tasks]
+        logger.info(f"[GPU {gpu_id}] Running inference on batch of {len(tasks)}: {video_names}")
+
+        try:
+            # Run inference (GPU work)
+            captions, timing = captioner.run_inference(preprocessed, max_tokens)
+
+            # Log timing
+            total_time = sum(timing.values())
+            if total_time > 0:
+                logger.info(
+                    f"[GPU {gpu_id}] Timing: "
+                    f"preprocess={timing.get('preprocess', 0):.2f}s ({timing.get('preprocess', 0)/total_time*100:.1f}%), "
+                    f"transfer={timing.get('transfer', 0):.2f}s ({timing.get('transfer', 0)/total_time*100:.1f}%), "
+                    f"inference={timing.get('inference', 0):.2f}s ({timing.get('inference', 0)/total_time*100:.1f}%), "
+                    f"decode={timing.get('decode', 0):.2f}s ({timing.get('decode', 0)/total_time*100:.1f}%)"
+                )
+
+            # Log sample caption for quality monitoring
+            if captions:
+                sample_name = tasks[0]["name"]
+                sample_caption = captions[0][:200] + "..." if len(captions[0]) > 200 else captions[0]
+                logger.info(f"[GPU {gpu_id}] Sample [{sample_name}]: {sample_caption}")
+
+            # Upload results
+            t_start_upload = time.time()
+            for video_info, caption in zip(tasks, captions):
+                video_key = video_info["key"]
+                video_name = video_info["name"]
+
+                try:
+                    caption_key = s3_handler.upload_caption(
+                        bucket=video_info["bucket"],
+                        video_key=video_key,
+                        caption=caption,
+                    )
+                    result_queue.put({
+                        "video_key": video_key,
+                        "video_name": video_name,
+                        "success": True,
+                        "caption_key": caption_key,
+                        "error": None,
+                        "skipped": False,
+                    })
+                except Exception as e:
+                    logger.error(f"[GPU {gpu_id}] Upload error {video_name}: {e}")
+                    result_queue.put({
+                        "video_key": video_key,
+                        "video_name": video_name,
+                        "success": False,
+                        "caption_key": None,
+                        "error": str(e),
+                        "skipped": False,
+                    })
+
+            logger.info(f"[GPU {gpu_id}] Upload: {time.time() - t_start_upload:.2f}s for {len(tasks)} captions")
+
+        except Exception as e:
+            logger.error(f"[GPU {gpu_id}] Batch error: {e}")
+            for video_info in tasks:
+                result_queue.put({
+                    "video_key": video_info["key"],
+                    "video_name": video_info["name"],
+                    "success": False,
+                    "caption_key": None,
+                    "error": str(e),
+                    "skipped": False,
+                })
+
+    # Main loop with prefetching
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        # Get first batch with actual work (skip empty batches)
+        current_tasks = []
+        got_poison = False
+        skipped_count = 0
+        while not current_tasks and not got_poison:
+            current_tasks, got_poison = collect_batch()
+            if not current_tasks and not got_poison:
+                skipped_count += batch_size
+                if skipped_count % 1000 == 0:
+                    logger.info(f"[GPU {gpu_id}] Skipped {skipped_count} videos so far, searching for work...")
+
+        if not current_tasks:
+            logger.info(f"[GPU {gpu_id}] No tasks to process (skipped {skipped_count}), exiting")
+            return
+
+        # Preprocess first batch synchronously
+        logger.info(f"[GPU {gpu_id}] Found first batch of {len(current_tasks)} after skipping {skipped_count}")
+        current_preprocessed, current_tasks = preprocess_task(current_tasks)
+        prefetch_future = None
+
+        while True:
+            # Start prefetch for next batch in background (if we have a future from previous iteration)
+            # The future was submitted at end of previous iteration
+
+            # Process current batch (GPU inference) - runs in parallel with prefetch
+            process_batch(current_preprocessed, current_tasks)
+
+            # Now collect and prepare next batch
+            if prefetch_future:
+                # Wait for prefetch that was running during GPU work
+                current_preprocessed, current_tasks = prefetch_future.result()
+                prefetch_future = None
+            else:
+                current_preprocessed, current_tasks = None, []
+
+            # Check if we're done
+            if got_poison and not current_tasks:
+                break
+
+            # If no current tasks, need to collect more
+            if not current_tasks:
+                while not current_tasks and not got_poison:
+                    current_tasks, got_poison = collect_batch()
+                    if not current_tasks and not got_poison:
+                        skipped_count += batch_size
+
+                if not current_tasks:
+                    break
+
+                # Preprocess synchronously since we don't have a prefetch ready
+                current_preprocessed, current_tasks = preprocess_task(current_tasks)
+
+            # Submit prefetch for the batch AFTER next (to run during next GPU work)
+            if not got_poison:
+                next_tasks = []
+                # Try to get next batch (non-blocking collection)
+                next_tasks, got_poison = collect_batch()
+                # Skip empty batches
+                while not next_tasks and not got_poison:
+                    next_tasks, got_poison = collect_batch()
+                    if not next_tasks and not got_poison:
+                        skipped_count += batch_size
+
+                if next_tasks:
+                    logger.info(f"[GPU {gpu_id}] Prefetching batch of {len(next_tasks)}...")
+                    prefetch_future = executor.submit(preprocess_task, next_tasks)
+
+    # Cleanup
+    del captioner
+    torch.cuda.empty_cache()
+    logger.info(f"[GPU {gpu_id}] Worker finished")
 
 
 def process_videos_parallel(
@@ -133,6 +275,7 @@ def process_videos_parallel(
     max_tokens: int = 512,
     num_gpus: Optional[int] = None,
     skip_existing: bool = True,
+    batch_size: int = 1,
 ) -> List[dict]:
     """
     Process all videos in an S3 directory using multiple GPUs in parallel.
@@ -144,6 +287,7 @@ def process_videos_parallel(
         max_tokens: Maximum tokens to generate per caption
         num_gpus: Number of GPUs to use (None = all available)
         skip_existing: Skip videos that already have captions
+        batch_size: Number of videos to process per batch per GPU
 
     Returns:
         List of processing results
@@ -156,7 +300,7 @@ def process_videos_parallel(
     if num_gpus is not None:
         available_gpus = available_gpus[:num_gpus]
 
-    logger.info(f"Using {len(available_gpus)} GPU(s): {available_gpus}")
+    logger.info(f"Using {len(available_gpus)} GPU(s): {available_gpus}, batch_size={batch_size}")
 
     # List videos from S3
     s3_handler = S3Handler()
@@ -168,45 +312,40 @@ def process_videos_parallel(
 
     logger.info(f"Found {len(videos)} video(s) to process")
 
-    results = []
-
     # Use spawn context for CUDA compatibility
     ctx = get_context("spawn")
 
-    # Process videos in parallel across GPUs
-    with ProcessPoolExecutor(
-        max_workers=len(available_gpus),
-        mp_context=ctx,
-    ) as executor:
-        # Submit jobs round-robin to GPUs
-        futures = {}
-        for i, video in enumerate(videos):
-            gpu_id = available_gpus[i % len(available_gpus)]
-            future = executor.submit(
-                process_video_on_gpu,
-                video,
-                gpu_id,
-                prompt,
-                fps,
-                max_tokens,
-                skip_existing,
-            )
-            futures[future] = video
+    # Create queues
+    task_queue = ctx.Queue()
+    result_queue = ctx.Queue()
 
-        # Collect results
-        for future in as_completed(futures):
-            video = futures[future]
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                logger.error(f"Failed to process {video['name']}: {e}")
-                results.append({
-                    "video_key": video["key"],
-                    "video_name": video["name"],
-                    "success": False,
-                    "error": str(e),
-                })
+    # Start worker processes (one per GPU)
+    workers = []
+    for gpu_id in available_gpus:
+        p = ctx.Process(
+            target=gpu_worker,
+            args=(gpu_id, task_queue, result_queue, prompt, fps, max_tokens, skip_existing, batch_size),
+        )
+        p.start()
+        workers.append(p)
+
+    # Submit all tasks to the queue
+    for video in videos:
+        task_queue.put(video)
+
+    # Send poison pills to stop workers (one per worker)
+    for _ in workers:
+        task_queue.put(None)
+
+    # Collect results
+    results = []
+    for _ in range(len(videos)):
+        result = result_queue.get()
+        results.append(result)
+
+    # Wait for all workers to finish
+    for p in workers:
+        p.join()
 
     return results
 
@@ -250,6 +389,12 @@ def main():
         action="store_true",
         help="Process videos even if caption already exists",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Number of videos to process per batch per GPU (default: 2)",
+    )
 
     args = parser.parse_args()
 
@@ -271,6 +416,7 @@ def main():
             max_tokens=args.max_tokens,
             num_gpus=args.num_gpus,
             skip_existing=not args.no_skip_existing,
+            batch_size=args.batch_size,
         )
 
         # Summary
