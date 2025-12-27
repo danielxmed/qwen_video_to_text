@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Video to Text Captioning System using Qwen2.5-VL.
+Video to Text Captioning System using Qwen2.5-VL - REVERSE ORDER.
 
-Processes videos from an S3 directory, generates captions using Qwen2.5-VL model,
-and uploads the caption files back to S3.
+Processes videos from an S3 directory IN REVERSE ORDER (last to first),
+generates captions using Qwen2.5-VL model, and uploads the caption files back to S3.
+
+Use this script on a second instance to process from the end while main.py
+processes from the beginning.
 """
 
 import argparse
@@ -24,7 +27,7 @@ from video_captioner import VideoCaptioner
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(processName)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(processName)s - [REVERSE] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
     ],
@@ -279,9 +282,11 @@ def process_videos_parallel(
     num_gpus: Optional[int] = None,
     skip_existing: bool = True,
     batch_size: int = 1,
+    stop_at_position: Optional[int] = None,
 ) -> List[dict]:
     """
     Process all videos in an S3 directory using multiple GPUs in parallel.
+    REVERSE ORDER - starts from the last video.
 
     Args:
         s3_url: S3 URL to the directory containing videos
@@ -291,6 +296,7 @@ def process_videos_parallel(
         num_gpus: Number of GPUs to use (None = all available)
         skip_existing: Skip videos that already have captions
         batch_size: Number of videos to process per batch per GPU
+        stop_at_position: Stop when reaching this position (from original order)
 
     Returns:
         List of processing results
@@ -313,7 +319,23 @@ def process_videos_parallel(
         logger.warning(f"No .mp4 videos found in {s3_url}")
         return []
 
-    logger.info(f"Found {len(videos)} video(s) to process")
+    total_videos = len(videos)
+    logger.info(f"Found {total_videos} video(s) total")
+
+    # REVERSE the order
+    videos = list(reversed(videos))
+    logger.info(f"*** REVERSE MODE: Processing from position {total_videos - 1} down to {stop_at_position or 0} ***")
+
+    # If stop_at_position is set, only process videos until that position
+    if stop_at_position is not None:
+        # In reversed list, we want to stop at (total - stop_at_position) videos
+        # Original positions: 0, 1, 2, ..., stop_at, ..., N-1
+        # Reversed positions: N-1, N-2, ..., stop_at, ..., 0
+        # We want to process from N-1 down to stop_at (inclusive)
+        # That's (N-1 - stop_at + 1) = N - stop_at videos
+        videos_to_process = total_videos - stop_at_position
+        videos = videos[:videos_to_process]
+        logger.info(f"Will process {len(videos)} videos (from position {total_videos - 1} down to {stop_at_position})")
 
     # Use spawn context for CUDA compatibility
     ctx = get_context("spawn")
@@ -472,7 +494,7 @@ def process_videos_parallel(
                 continue
             results.append(result)
             if len(results) % 100 == 0:
-                logger.info(f"Progress: {len(results)}/{expected_results} results collected")
+                logger.info(f"Progress: {len(results)}/{expected_results} results collected (REVERSE)")
         except:
             pass  # Queue timeout, continue
 
@@ -488,7 +510,7 @@ def process_videos_parallel(
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Generate captions for videos in S3 using Qwen2.5-VL"
+        description="Generate captions for videos in S3 using Qwen2.5-VL - REVERSE ORDER"
     )
     parser.add_argument(
         "s3_url",
@@ -530,6 +552,12 @@ def main():
         default=2,
         help="Number of videos to process per batch per GPU (default: 2)",
     )
+    parser.add_argument(
+        "--stop-at",
+        type=int,
+        default=261663,  # Default: middle of 523325 videos
+        help="Stop when reaching this position from original order (default: 261663 = middle)",
+    )
 
     args = parser.parse_args()
 
@@ -541,7 +569,8 @@ def main():
         logger.error("AWS credentials not found. Please set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
         sys.exit(1)
 
-    logger.info(f"Starting video captioning for: {args.s3_url}")
+    logger.info(f"Starting REVERSE video captioning for: {args.s3_url}")
+    logger.info(f"Will process from end until position {args.stop_at}")
 
     try:
         results = process_videos_parallel(
@@ -552,6 +581,7 @@ def main():
             num_gpus=args.num_gpus,
             skip_existing=not args.no_skip_existing,
             batch_size=args.batch_size,
+            stop_at_position=args.stop_at,
         )
 
         # Summary
@@ -560,7 +590,7 @@ def main():
         failed = sum(1 for r in results if not r["success"])
 
         logger.info(f"\n{'='*50}")
-        logger.info(f"Processing complete!")
+        logger.info(f"REVERSE Processing complete!")
         logger.info(f"  Successful: {successful}")
         logger.info(f"  Skipped (existing): {skipped}")
         logger.info(f"  Failed: {failed}")
