@@ -117,6 +117,7 @@ def gpu_worker(
     def preprocess_task(tasks):
         """Preprocess a batch (download videos, extract frames)."""
         if not tasks:
+          
             return None, tasks, []
         video_urls = [t["url"] for t in tasks]
         preprocessed = captioner.preprocess_batch(video_urls, prompt, fps)
