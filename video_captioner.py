@@ -121,22 +121,50 @@ class VideoCaptioner:
         # Process all inputs in parallel (downloads videos and extracts frames)
         def process_single(idx_conv):
             idx, conversation = idx_conv
-            inputs = self.processor.apply_chat_template(
-                conversation,
-                fps=fps,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            return idx, inputs
+            try:
+                inputs = self.processor.apply_chat_template(
+                    conversation,
+                    fps=fps,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                return idx, inputs, None  # No error
+            except KeyError as e:
+                # Handle missing video metadata (e.g., video_fps)
+                return idx, None, f"Video metadata error: {e}"
+            except Exception as e:
+                # Handle any other video decoding errors
+                return idx, None, f"Video processing error: {e}"
 
         batch_inputs = [None] * len(conversations)
+        failed_indices = []  # Track which videos failed
         with ThreadPoolExecutor(max_workers=len(conversations)) as executor:
             futures = [executor.submit(process_single, (i, conv)) for i, conv in enumerate(conversations)]
             for future in as_completed(futures):
-                idx, inputs = future.result()
-                batch_inputs[idx] = inputs
+                idx, inputs, error = future.result()
+                if error is not None:
+                    failed_indices.append((idx, error))
+                else:
+                    batch_inputs[idx] = inputs
+
+        # Filter out failed videos
+        if failed_indices:
+            # Return info about failures
+            valid_indices = [i for i in range(len(batch_inputs)) if batch_inputs[i] is not None]
+            batch_inputs = [batch_inputs[i] for i in valid_indices]
+
+            if not batch_inputs:
+                # All videos failed
+                return {
+                    "empty": True,
+                    "num_videos": 0,
+                    "failed_indices": failed_indices,
+                    "preprocess_time": time.time() - t_start,
+                }
+        else:
+            valid_indices = list(range(len(batch_inputs)))
 
         # Pad inputs to same length for batching
         max_len = max(inp["input_ids"].shape[1] for inp in batch_inputs)
@@ -169,13 +197,15 @@ class VideoCaptioner:
 
         return {
             "empty": False,
-            "num_videos": len(video_urls),
+            "num_videos": len(batch_inputs),  # Only count successfully processed videos
             "max_len": max_len,
             "padded_input_ids": padded_input_ids,
             "padded_attention_mask": padded_attention_mask,
             "pixel_values_list": pixel_values_list,
             "video_grid_thw_list": video_grid_thw_list,
             "preprocess_time": preprocess_time,
+            "valid_indices": valid_indices,  # Indices of videos that were successfully processed
+            "failed_indices": failed_indices,  # List of (idx, error_msg) for failed videos
         }
 
     def run_inference(

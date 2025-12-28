@@ -15,7 +15,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Process, Queue, get_context
+from multiprocessing import Process, Queue, get_context, Manager
 from typing import List, Optional
 
 import torch
@@ -52,6 +52,8 @@ def gpu_worker(
     skip_existing: bool,
     batch_size: int = 1,
     init_delay: float = 0.0,
+    in_progress_videos: dict = None,
+    bad_videos: set = None,
 ):
     """
     Persistent GPU worker with prefetching for optimal GPU utilization.
@@ -96,11 +98,24 @@ def gpu_worker(
                 break
             batch_tasks.append(task)
 
-        # Filter out already processed videos
+        # Filter out already processed videos and bad videos
         tasks_to_process = []
         for video_info in batch_tasks:
             video_key = video_info["key"]
             video_name = video_info["name"]
+
+            # Skip videos that previously caused crashes
+            if bad_videos is not None and video_key in bad_videos:
+                logger.warning(f"[GPU {gpu_id}] Skipping {video_name} - marked as problematic (caused crash)")
+                result_queue.put({
+                    "video_key": video_key,
+                    "video_name": video_name,
+                    "success": False,
+                    "caption_key": None,
+                    "error": "Video marked as problematic - caused decoder crash",
+                    "skipped": True,
+                })
+                continue
 
             if skip_existing and s3_handler.check_caption_exists(video_info["bucket"], video_key):
                 logger.info(f"[GPU {gpu_id}] Skipping {video_name} - caption exists")
@@ -121,8 +136,52 @@ def gpu_worker(
         """Preprocess a batch (download videos, extract frames)."""
         if not tasks:
             return None, tasks
+
+        video_keys = [t["key"] for t in tasks]
+        video_names = [t["name"] for t in tasks]
+
+        # Record which videos we're about to preprocess (for crash recovery)
+        if in_progress_videos is not None:
+            in_progress_videos[gpu_id] = video_keys
+
+        logger.info(f"[GPU {gpu_id}] Preprocessing batch: {video_names}")
+
         video_urls = [t["url"] for t in tasks]
         preprocessed = captioner.preprocess_batch(video_urls, prompt, fps)
+
+        # Clear in-progress after successful preprocessing
+        if in_progress_videos is not None:
+            in_progress_videos[gpu_id] = []
+
+        # Handle failed videos from preprocessing
+        failed_indices = preprocessed.get("failed_indices", [])
+        if failed_indices:
+            for idx, error in failed_indices:
+                video_info = tasks[idx]
+                logger.warning(f"[GPU {gpu_id}] Preprocessing failed for {video_info['name']}: {error}")
+                result_queue.put({
+                    "video_key": video_info["key"],
+                    "video_name": video_info["name"],
+                    "success": False,
+                    "caption_key": None,
+                    "error": error,
+                    "skipped": False,
+                })
+                # Mark as bad video to skip in future
+                if bad_videos is not None:
+                    bad_videos[video_info["key"]] = True
+
+            # Filter tasks to only include successfully preprocessed videos
+            valid_indices = preprocessed.get("valid_indices", [])
+            tasks = [tasks[i] for i in valid_indices]
+            logger.info(f"[GPU {gpu_id}] {len(failed_indices)} videos failed, {len(tasks)} remaining in batch")
+
+        if preprocessed.get("empty", False):
+            logger.info(f"[GPU {gpu_id}] All videos in batch failed preprocessing")
+            return None, []
+
+        logger.info(f"[GPU {gpu_id}] Preprocessing complete for batch: {[t['name'] for t in tasks]}")
+
         return preprocessed, tasks
 
     def process_batch(preprocessed, tasks):
@@ -283,6 +342,7 @@ def process_videos_parallel(
     skip_existing: bool = True,
     batch_size: int = 1,
     stop_at_position: Optional[int] = None,
+    start_from_position: Optional[int] = None,
 ) -> List[dict]:
     """
     Process all videos in an S3 directory using multiple GPUs in parallel.
@@ -297,6 +357,7 @@ def process_videos_parallel(
         skip_existing: Skip videos that already have captions
         batch_size: Number of videos to process per batch per GPU
         stop_at_position: Stop when reaching this position (from original order)
+        start_from_position: Start from this position instead of the last video
 
     Returns:
         List of processing results
@@ -324,18 +385,24 @@ def process_videos_parallel(
 
     # REVERSE the order
     videos = list(reversed(videos))
-    logger.info(f"*** REVERSE MODE: Processing from position {total_videos - 1} down to {stop_at_position or 0} ***")
+
+    # Determine start position (default: last video)
+    start_pos = total_videos - 1
+    if start_from_position is not None:
+        start_pos = min(start_from_position, total_videos - 1)
+        # Skip videos after start_from_position (they come first in reversed list)
+        skip_count = total_videos - 1 - start_pos
+        videos = videos[skip_count:]
+        logger.info(f"*** REVERSE MODE: Skipping {skip_count} videos, starting from position {start_pos} ***")
+
+    logger.info(f"*** REVERSE MODE: Processing from position {start_pos} down to {stop_at_position or 0} ***")
 
     # If stop_at_position is set, only process videos until that position
     if stop_at_position is not None:
-        # In reversed list, we want to stop at (total - stop_at_position) videos
-        # Original positions: 0, 1, 2, ..., stop_at, ..., N-1
-        # Reversed positions: N-1, N-2, ..., stop_at, ..., 0
-        # We want to process from N-1 down to stop_at (inclusive)
-        # That's (N-1 - stop_at + 1) = N - stop_at videos
-        videos_to_process = total_videos - stop_at_position
+        # Calculate how many videos to process from current start_pos down to stop_at
+        videos_to_process = start_pos - stop_at_position + 1
         videos = videos[:videos_to_process]
-        logger.info(f"Will process {len(videos)} videos (from position {total_videos - 1} down to {stop_at_position})")
+        logger.info(f"Will process {len(videos)} videos (from position {start_pos} down to {stop_at_position})")
 
     # Use spawn context for CUDA compatibility
     ctx = get_context("spawn")
@@ -343,6 +410,11 @@ def process_videos_parallel(
     # Create queues
     task_queue = ctx.Queue()
     result_queue = ctx.Queue()
+
+    # Shared state for crash recovery
+    manager = Manager()
+    in_progress_videos = manager.dict()  # gpu_id -> list of video keys being preprocessed
+    bad_videos = manager.dict()  # Videos that caused crashes (key -> True)
 
     # Sequential initialization timeout per GPU
     INIT_TIMEOUT_PER_GPU = 120  # 2 minutes per GPU
@@ -352,7 +424,7 @@ def process_videos_parallel(
         """Start a worker process for a GPU."""
         p = ctx.Process(
             target=gpu_worker,
-            args=(gpu_id, task_queue, result_queue, prompt, fps, max_tokens, skip_existing, batch_size, delay),
+            args=(gpu_id, task_queue, result_queue, prompt, fps, max_tokens, skip_existing, batch_size, delay, in_progress_videos, bad_videos),
         )
         p.start()
         return p
@@ -446,10 +518,10 @@ def process_videos_parallel(
     # Collect results with worker health monitoring and auto-restart
     results = []
     expected_results = len(videos)
-    check_interval = 10  # Check worker health every 10 seconds
+    check_interval = 5  # Check worker health every 5 seconds (faster detection)
     last_check = time.time()
     worker_restart_count = {}  # gpu_id -> restart count
-    MAX_RUNTIME_RESTARTS = 3
+    MAX_RUNTIME_RESTARTS = 50  # Allow many restarts since we skip bad videos
 
     while len(results) < expected_results:
         # Check worker health periodically
@@ -460,6 +532,15 @@ def process_videos_parallel(
                 p = active_workers[gpu_id]
                 if not p.is_alive():
                     restart_count = worker_restart_count.get(gpu_id, 0)
+
+                    # Mark in-progress videos as bad (they likely caused the crash)
+                    if gpu_id in in_progress_videos and in_progress_videos[gpu_id]:
+                        crashed_videos = list(in_progress_videos[gpu_id])
+                        logger.warning(f"[GPU {gpu_id}] Marking {len(crashed_videos)} videos as problematic: {crashed_videos}")
+                        for video_key in crashed_videos:
+                            bad_videos[video_key] = True
+                        in_progress_videos[gpu_id] = []
+                        logger.info(f"Total bad videos: {len(bad_videos)}")
 
                     if restart_count < MAX_RUNTIME_RESTARTS:
                         logger.warning(f"[GPU {gpu_id}] Worker died (exit code: {p.exitcode}), restarting ({restart_count + 1}/{MAX_RUNTIME_RESTARTS})...")
@@ -503,6 +584,14 @@ def process_videos_parallel(
         p.join(timeout=10)
         if p.is_alive():
             p.terminate()
+
+    # Log summary of bad videos
+    if bad_videos:
+        logger.info(f"Total problematic videos skipped: {len(bad_videos)}")
+        for key in list(bad_videos.keys())[:20]:  # Show first 20
+            logger.info(f"  - {key}")
+        if len(bad_videos) > 20:
+            logger.info(f"  ... and {len(bad_videos) - 20} more")
 
     return results
 
@@ -558,6 +647,12 @@ def main():
         default=261663,  # Default: middle of 523325 videos
         help="Stop when reaching this position from original order (default: 261663 = middle)",
     )
+    parser.add_argument(
+        "--start-from",
+        type=int,
+        default=None,
+        help="Start from this position instead of the last video (use to skip problematic videos at the end)",
+    )
 
     args = parser.parse_args()
 
@@ -570,7 +665,10 @@ def main():
         sys.exit(1)
 
     logger.info(f"Starting REVERSE video captioning for: {args.s3_url}")
-    logger.info(f"Will process from end until position {args.stop_at}")
+    if args.start_from:
+        logger.info(f"Will process from position {args.start_from} down to {args.stop_at}")
+    else:
+        logger.info(f"Will process from end until position {args.stop_at}")
 
     try:
         results = process_videos_parallel(
@@ -582,6 +680,7 @@ def main():
             skip_existing=not args.no_skip_existing,
             batch_size=args.batch_size,
             stop_at_position=args.stop_at,
+            start_from_position=args.start_from,
         )
 
         # Summary
