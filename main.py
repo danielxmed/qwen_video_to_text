@@ -117,41 +117,25 @@ def gpu_worker(
     def preprocess_task(tasks):
         """Preprocess a batch (download videos, extract frames)."""
         if not tasks:
-            return None, tasks
-
-        video_names = [t["name"] for t in tasks]
-        logger.info(f"[GPU {gpu_id}] Preprocessing batch: {video_names}")
-
+          
+            return None, tasks, []
         video_urls = [t["url"] for t in tasks]
         preprocessed = captioner.preprocess_batch(video_urls, prompt, fps)
 
-        # Handle failed videos from preprocessing
-        failed_indices = preprocessed.get("failed_indices", [])
+        # Handle preprocessing failures - report them immediately
+        failed_tasks = []
+        failed_indices = preprocessed.get("failed_indices", {})
         if failed_indices:
-            for idx, error in failed_indices:
-                video_info = tasks[idx]
-                logger.warning(f"[GPU {gpu_id}] Preprocessing failed for {video_info['name']}: {error}")
-                result_queue.put({
-                    "video_key": video_info["key"],
-                    "video_name": video_info["name"],
-                    "success": False,
-                    "caption_key": None,
-                    "error": error,
-                    "skipped": False,
-                })
+            for idx, error in failed_indices.items():
+                failed_task = tasks[idx]
+                logger.warning(f"[GPU {gpu_id}] Preprocessing failed for {failed_task['name']}: {error}")
+                failed_tasks.append((failed_task, error))
 
-            # Filter tasks to only include successfully preprocessed videos
-            valid_indices = preprocessed.get("valid_indices", [])
-            tasks = [tasks[i] for i in valid_indices]
-            logger.info(f"[GPU {gpu_id}] {len(failed_indices)} videos failed, {len(tasks)} remaining in batch")
+        # Filter tasks to only include valid ones
+        valid_indices = preprocessed.get("valid_indices", list(range(len(tasks))))
+        valid_tasks = [tasks[i] for i in valid_indices]
 
-        if preprocessed.get("empty", False):
-            logger.info(f"[GPU {gpu_id}] All videos in batch failed preprocessing")
-            return None, []
-
-        logger.info(f"[GPU {gpu_id}] Preprocessing complete for batch: {[t['name'] for t in tasks]}")
-
-        return preprocessed, tasks
+        return preprocessed, valid_tasks, failed_tasks
 
     def process_batch(preprocessed, tasks):
         """Run inference and upload results."""
@@ -246,7 +230,19 @@ def gpu_worker(
 
         # Preprocess first batch synchronously
         logger.info(f"[GPU {gpu_id}] Found first batch of {len(current_tasks)} after skipping {skipped_count}")
-        current_preprocessed, current_tasks = preprocess_task(current_tasks)
+        current_preprocessed, current_tasks, failed_tasks = preprocess_task(current_tasks)
+
+        # Report preprocessing failures
+        for failed_task, error in failed_tasks:
+            result_queue.put({
+                "video_key": failed_task["key"],
+                "video_name": failed_task["name"],
+                "success": False,
+                "caption_key": None,
+                "error": f"Preprocessing failed: {error}",
+                "skipped": False,
+            })
+
         prefetch_future = None
 
         while True:
@@ -259,8 +255,19 @@ def gpu_worker(
             # Now collect and prepare next batch
             if prefetch_future:
                 # Wait for prefetch that was running during GPU work
-                current_preprocessed, current_tasks = prefetch_future.result()
+                current_preprocessed, current_tasks, failed_tasks = prefetch_future.result()
                 prefetch_future = None
+
+                # Report preprocessing failures from prefetch
+                for failed_task, error in failed_tasks:
+                    result_queue.put({
+                        "video_key": failed_task["key"],
+                        "video_name": failed_task["name"],
+                        "success": False,
+                        "caption_key": None,
+                        "error": f"Preprocessing failed: {error}",
+                        "skipped": False,
+                    })
             else:
                 current_preprocessed, current_tasks = None, []
 
@@ -279,7 +286,18 @@ def gpu_worker(
                     break
 
                 # Preprocess synchronously since we don't have a prefetch ready
-                current_preprocessed, current_tasks = preprocess_task(current_tasks)
+                current_preprocessed, current_tasks, failed_tasks = preprocess_task(current_tasks)
+
+                # Report preprocessing failures
+                for failed_task, error in failed_tasks:
+                    result_queue.put({
+                        "video_key": failed_task["key"],
+                        "video_name": failed_task["name"],
+                        "success": False,
+                        "caption_key": None,
+                        "error": f"Preprocessing failed: {error}",
+                        "skipped": False,
+                    })
 
             # Submit prefetch for the batch AFTER next (to run during next GPU work)
             if not got_poison:
