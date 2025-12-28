@@ -83,6 +83,7 @@ class VideoCaptioner:
         video_urls: list,
         prompt: str = None,
         fps: float = 1.0,
+        max_retries: int = 3,
     ) -> dict:
         """
         Preprocess videos: download and extract frames (CPU/IO bound).
@@ -92,6 +93,7 @@ class VideoCaptioner:
             video_urls: List of URLs to video files
             prompt: Custom prompt for caption generation
             fps: Frames per second to sample from video
+            max_retries: Maximum retry attempts for failed downloads
 
         Returns:
             Dict with preprocessed data ready for run_inference
@@ -121,32 +123,63 @@ class VideoCaptioner:
         # Process all inputs in parallel (downloads videos and extracts frames)
         def process_single(idx_conv):
             idx, conversation = idx_conv
-            inputs = self.processor.apply_chat_template(
-                conversation,
-                fps=fps,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-            )
-            return idx, inputs
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    inputs = self.processor.apply_chat_template(
+                        conversation,
+                        fps=fps,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt",
+                    )
+                    return idx, inputs, None
+                except Exception as e:
+                    last_error = str(e)
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 1s, 2s, 4s
+                        time.sleep(2 ** attempt)
+
+            return idx, None, last_error
 
         batch_inputs = [None] * len(conversations)
+        failed_indices = {}  # idx -> error message
         with ThreadPoolExecutor(max_workers=len(conversations)) as executor:
             futures = [executor.submit(process_single, (i, conv)) for i, conv in enumerate(conversations)]
             for future in as_completed(futures):
-                idx, inputs = future.result()
-                batch_inputs[idx] = inputs
+                idx, inputs, error = future.result()
+                if error is not None:
+                    failed_indices[idx] = error
+                else:
+                    batch_inputs[idx] = inputs
+
+        # Filter out failed videos
+        valid_inputs = [(i, inp) for i, inp in enumerate(batch_inputs) if inp is not None]
+
+        if not valid_inputs:
+            # All videos failed
+            return {
+                "empty": True,
+                "num_videos": 0,
+                "failed_indices": failed_indices,
+                "valid_indices": [],
+                "preprocess_time": time.time() - t_start,
+            }
+
+        valid_indices = [i for i, _ in valid_inputs]
+        valid_batch_inputs = [inp for _, inp in valid_inputs]
 
         # Pad inputs to same length for batching
-        max_len = max(inp["input_ids"].shape[1] for inp in batch_inputs)
+        max_len = max(inp["input_ids"].shape[1] for inp in valid_batch_inputs)
 
         padded_input_ids = []
         padded_attention_mask = []
         pixel_values_list = []
         video_grid_thw_list = []
 
-        for inputs in batch_inputs:
+        for inputs in valid_batch_inputs:
             seq_len = inputs["input_ids"].shape[1]
             padding_len = max_len - seq_len
 
@@ -169,13 +202,15 @@ class VideoCaptioner:
 
         return {
             "empty": False,
-            "num_videos": len(video_urls),
+            "num_videos": len(valid_batch_inputs),
             "max_len": max_len,
             "padded_input_ids": padded_input_ids,
             "padded_attention_mask": padded_attention_mask,
             "pixel_values_list": pixel_values_list,
             "video_grid_thw_list": video_grid_thw_list,
             "preprocess_time": preprocess_time,
+            "valid_indices": valid_indices,
+            "failed_indices": failed_indices,
         }
 
     def run_inference(
